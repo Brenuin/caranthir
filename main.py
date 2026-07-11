@@ -6,15 +6,29 @@ from typing import Iterable
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
+from hotreload import check_and_reload
 from prompts import SYSTEM_PROMPT
-from terminal_ui import print_banner, print_error, print_reply, print_tool_call, user_prompt_label
+from terminal_ui import (
+    StreamPrinter,
+    print_banner,
+    print_error,
+    print_notice,
+    user_prompt_label,
+)
 
 
 DEFAULT_MODEL = "gpt-4.1-mini"
@@ -44,17 +58,24 @@ EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 
 
 def build_llm(
-    model: str, provider: str | None, effort: str | None
+    model: str, provider: str | None, effort: str | None, show_thinking: bool = False
 ) -> tuple[BaseChatModel, str]:
     provider = provider or infer_provider(model)
     if provider == "openai":
         if effort:
             raise ValueError("--effort is only supported for Anthropic models right now.")
+        if show_thinking:
+            raise ValueError("--show-thinking is only supported for Anthropic models right now.")
         return ChatOpenAI(model=model), provider
     if provider == "anthropic":
+        kwargs = {}
         if effort:
-            return ChatAnthropic(model=model, effort=effort), provider
-        return ChatAnthropic(model=model), provider
+            kwargs["effort"] = effort
+        if show_thinking:
+            # Thinking happens either way on adaptive-thinking models; "display"
+            # only controls whether the API returns a readable summary of it.
+            kwargs["thinking"] = {"type": "adaptive", "display": "summarized"}
+        return ChatAnthropic(model=model, **kwargs), provider
     raise ValueError(f"Unknown provider {provider!r}. Use 'openai' or 'anthropic'.")
 
 
@@ -76,8 +97,17 @@ HOSTED_TOOLS = [
 ]
 
 
-def build_agent(model: str, provider: str | None, effort: str | None, hosted: bool):
-    llm, resolved_provider = build_llm(model, provider, effort)
+def build_agent(
+    model: str,
+    provider: str | None,
+    effort: str | None,
+    hosted: bool,
+    show_thinking: bool = False,
+    checkpointer=None,
+):
+    # Pass an existing checkpointer to keep conversation history across
+    # rebuilds (hot reload does this); omit it for a fresh one.
+    llm, resolved_provider = build_llm(model, provider, effort, show_thinking)
     if hosted and resolved_provider != "anthropic":
         raise ValueError("--hosted-tools is only supported for Anthropic models right now.")
     bindable = [*HOSTED_TOOLS, *TOOLS] if hosted else TOOLS
@@ -95,7 +125,7 @@ def build_agent(model: str, provider: str | None, effort: str | None, hosted: bo
     graph.add_conditional_edges("assistant", tools_condition)
     graph.add_edge("tools", "assistant")
 
-    return graph.compile(checkpointer=MemorySaver()), resolved_provider
+    return graph.compile(checkpointer=checkpointer or MemorySaver()), resolved_provider
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,6 +151,11 @@ def parse_args() -> argparse.Namespace:
         "--hosted-tools",
         action="store_true",
         help="Enable Anthropic server-side web search and code execution (Anthropic only).",
+    )
+    parser.add_argument(
+        "--show-thinking",
+        action="store_true",
+        help="Print the model's summarized reasoning above each reply (Anthropic only).",
     )
     return parser.parse_args()
 
@@ -154,48 +189,56 @@ def extract_text(content: str | list) -> str:
     return "\n".join(parts)
 
 
-def print_new_tool_calls(messages: list[BaseMessage], seen_ids: set[str]) -> None:
-    for message in messages:
-        if isinstance(message, ToolMessage) and message.tool_call_id not in seen_ids:
-            seen_ids.add(message.tool_call_id)
-            print_tool_call(message.name, message.content)
+def extract_thinking(content: str | list) -> str:
+    if isinstance(content, str):
+        return ""
+    parts = [
+        block["thinking"]
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "thinking" and block.get("thinking")
+    ]
+    return "\n".join(parts)
 
 
-def print_new_hosted_calls(messages: list[BaseMessage], seen_ids: set[str]) -> None:
-    for message in messages:
-        if not isinstance(message, AIMessage) or isinstance(message.content, str):
-            continue
-        for block in message.content:
-            if not isinstance(block, dict) or block.get("type") != "server_tool_use":
-                continue
-            block_id = block.get("id", "")
-            if block_id in seen_ids:
-                continue
-            seen_ids.add(block_id)
-            name = block.get("name", "?")
-            detail = str(block.get("input", ""))
-            if len(detail) > 100:
-                detail = detail[:100] + "..."
-            print_tool_call(f"{name} (hosted)", detail)
+def stream_turn(agent, prompt: str, config: dict, printer: StreamPrinter) -> None:
+    """Run one turn, printing output incrementally as it streams.
+
+    stream_mode="messages" yields (chunk, metadata) pairs: AIMessageChunks
+    token-by-token from any LLM call in the graph, and complete ToolMessages
+    when local tools finish.
+    """
+    for chunk, _metadata in agent.stream(
+        {"messages": [HumanMessage(content=prompt)]},
+        config=config,
+        stream_mode="messages",
+    ):
+        if isinstance(chunk, AIMessageChunk):
+            printer.feed_ai_content(chunk.content)
+        elif isinstance(chunk, ToolMessage):
+            printer.feed_local_tool(chunk.name, str(chunk.content))
 
 
 def main() -> None:
     load_dotenv()
     args = parse_args()
+    checkpointer = MemorySaver()  # outlives hot reloads so history survives them
     try:
         agent, resolved_provider = build_agent(
-            args.model, args.provider, args.effort, args.hosted_tools
+            args.model,
+            args.provider,
+            args.effort,
+            args.hosted_tools,
+            args.show_thinking,
+            checkpointer=checkpointer,
         )
     except ValueError as exc:
         print_error(str(exc))
         return
     config = {"configurable": {"thread_id": "terminal"}}
-    seen_tool_call_ids: set[str] = set()
-    seen_hosted_ids: set[str] = set()
-    seen_ai_message_ids: set[str] = set()
 
     print_banner(args.model, resolved_provider)
 
+    make_printer, run_turn = StreamPrinter, stream_turn
     while True:
         try:
             prompt = input(user_prompt_label()).strip()
@@ -209,18 +252,34 @@ def main() -> None:
         if not prompt:
             continue
 
+        fresh = check_and_reload()
+        if fresh is not None:
+            try:
+                agent, resolved_provider = fresh.build_agent(
+                    args.model,
+                    args.provider,
+                    args.effort,
+                    args.hosted_tools,
+                    args.show_thinking,
+                    checkpointer=checkpointer,
+                )
+                make_printer, run_turn = fresh.StreamPrinter, fresh.stream_turn
+                print_notice("code changed on disk — reloaded")
+            except Exception as exc:
+                print_error(f"reload failed, keeping old agent: {exc}")
+
+        printer = make_printer("Caranthir", show_thinking=args.show_thinking)
         try:
-            result = agent.invoke(
-                {"messages": [HumanMessage(content=prompt)]},
-                config=config,
-            )
+            run_turn(agent, prompt, config, printer)
+        except KeyboardInterrupt:
+            printer.finish()
+            print_error("interrupted — reply may be incomplete")
+            continue
         except Exception as exc:
+            printer.finish()
             print_error(str(exc))
             continue
-
-        print_new_tool_calls(result["messages"], seen_tool_call_ids)
-        print_new_hosted_calls(result["messages"], seen_hosted_ids)
-        print_reply("Caranthir", new_ai_text(result["messages"], seen_ai_message_ids))
+        printer.finish()
 
 
 if __name__ == "__main__":

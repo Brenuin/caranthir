@@ -1,72 +1,65 @@
 # Caranthir
 
-Caranthir is a small terminal agent built with LangGraph and OpenAI.
+Terminal agent with streaming replies, conversation memory, and tools. OpenAI and Anthropic via LangGraph.
 
-## Why LangGraph First?
+## Layout
 
-LangChain is useful for model adapters, tools, retrievers, and reusable chain pieces.
-LangGraph is the better starting point for this project because an agent needs explicit
-control flow: state, memory, tool routing, approval steps, planning, retries, and
-multi-step execution.
-
-This app uses both:
-
-- `langgraph` owns the agent loop and conversation state.
-- `langchain-openai` adapts OpenAI chat models into that graph.
+| File | Role |
+|------|------|
+| `main.py` | CLI, LLM/provider setup, LangGraph agent, streaming loop |
+| `terminal_ui.py` | Banner, colors, incremental stream printer |
+| `prompts.py` | System prompt |
+| `hotreload/` | Dev hot reload: backend edits apply on the next turn, no restart |
+| `tests.py` | Unit + optional live API tests |
+| `.env` | API keys and defaults (not committed) |
 
 ## Setup
-
-Create a virtual environment:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-Install dependencies:
-
-```powershell
 pip install -r requirements.txt
 ```
 
-The `.env` file stores:
+Put keys in `.env`:
 
-```text
-OPENAI_API_KEY=your_key_here
-OPENAI_MODEL=gpt-4.1-mini
 ```
-
-Keep `.env` private. It is ignored by git.
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_MODEL=gpt-4.1-mini          # optional default
+CARANTHIR_PROVIDER=openai          # optional; else inferred from model name
+```
 
 ## Run
 
 ```powershell
 python main.py
+python main.py --model claude-sonnet-4-5
+python main.py --model claude-sonnet-4-5 --effort high --show-thinking
+python main.py --model claude-sonnet-4-5 --hosted-tools
 ```
 
-Type a prompt and press Enter. Use `/exit`, `/quit`, or `Ctrl+C` to leave.
+| Flag | Notes |
+|------|--------|
+| `--model` | Model id (default: `OPENAI_MODEL` or `gpt-4.1-mini`) |
+| `--provider` | `openai` \| `anthropic` (inferred from name if omitted) |
+| `--effort` | Anthropic reasoning effort: `low`…`max` |
+| `--show-thinking` | Stream summarized thinking (Anthropic) |
+| `--hosted-tools` | Anthropic web search + code execution |
 
-To override the model for one run:
+Type a prompt and Enter. `/quit`, `/exit`, or `Ctrl+C` to leave.
+
+## Behavior
+
+- **Graph:** `assistant` ↔ local `ToolNode`; memory via `MemorySaver` (`thread_id=terminal`)
+- **Local tools:** `get_current_time`
+- **Hosted tools** (`--hosted-tools`, Anthropic only): web search, code execution
+- **Streaming:** token output, thinking blocks, and tool markers as they arrive
+- **Hot reload:** edits to `prompts.py`, `terminal_ui.py`, or agent logic in `main.py` are picked up on the next message; the REPL loop and CLI flags still need a restart
+
+## Tests
 
 ```powershell
-python main.py --model gpt-4.1-mini
+python tests.py              # unit + live API
+python tests.py --skip-live  # unit only
 ```
-
-## Current Architecture
-
-The first graph is intentionally small:
-
-```text
-START -> assistant -> END
-```
-
-The terminal loop sends user messages into the graph. LangGraph checkpoints the
-conversation in memory by `thread_id`, and the assistant node calls the OpenAI model
-through LangChain.
-
-Good next places to extend this are:
-
-- tools: shell, filesystem search, project inspection, web search
-- state: goals, active task, files touched, tool results
-- routing: decide whether to answer, call tools, plan, or ask the user
-- persistence: swap in a durable LangGraph checkpointer
