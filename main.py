@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import os
 from datetime import datetime
 from typing import Iterable
@@ -20,14 +21,16 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
+from document_rag import DOCUMENT_RAG_TOOLS
 from hotreload import check_and_reload
+from memory import MEMORY_TOOLS, memory_context, open_checkpointer
 from prompts import SYSTEM_PROMPT
 from terminal_ui import (
     StreamPrinter,
     print_banner,
     print_error,
     print_notice,
-    user_prompt_label,
+    read_user_input,
 )
 
 
@@ -85,8 +88,29 @@ def get_current_time() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# Sentinel string returned by start_voice() and checked for by the REPL loop
+# after a turn finishes, since a tool can't switch I/O modes by itself — it
+# can only signal the caller to do so.
+VOICE_MODE_SENTINEL = "__ENTER_VOICE_MODE__"
+
+
+@tool
+def start_voice() -> str:
+    """Switch the conversation to live voice mode (microphone + speakers).
+
+    Call this when the user asks to talk out loud, switch to voice, or have
+    a spoken conversation instead of typing — phrases like "let's talk over
+    voice" or "can we speak instead of typing"."""
+    return VOICE_MODE_SENTINEL
+
+
 # Local tools: run on this machine via ToolNode.
-TOOLS = [get_current_time]
+TOOLS = [get_current_time, start_voice, *MEMORY_TOOLS, *DOCUMENT_RAG_TOOLS]
+
+# Restricted tool set bound to the agent while a voice session is active:
+# no hosted tools, no code execution — keeps voice turns fast and simple.
+# start_voice is intentionally omitted; you're already in voice mode.
+VOICE_TOOLS = [get_current_time, *MEMORY_TOOLS, *DOCUMENT_RAG_TOOLS]
 
 # Anthropic server-side tools: executed on Anthropic's servers inside a single
 # model call. They never appear in AIMessage.tool_calls, so tools_condition
@@ -104,28 +128,55 @@ def build_agent(
     hosted: bool,
     show_thinking: bool = False,
     checkpointer=None,
+    tools: list = None,
 ):
     # Pass an existing checkpointer to keep conversation history across
     # rebuilds (hot reload does this); omit it for a fresh one.
+    # `tools` overrides the default TOOLS list (used for the voice-restricted
+    # agent); hosted tools never apply there since voice callers pass hosted=False.
+    local_tools = tools if tools is not None else TOOLS
     llm, resolved_provider = build_llm(model, provider, effort, show_thinking)
     if hosted and resolved_provider != "anthropic":
         raise ValueError("--hosted-tools is only supported for Anthropic models right now.")
-    bindable = [*HOSTED_TOOLS, *TOOLS] if hosted else TOOLS
+    bindable = [*HOSTED_TOOLS, *local_tools] if hosted else local_tools
     llm = llm.bind_tools(bindable)
 
     def assistant(state: MessagesState) -> dict[str, list[BaseMessage]]:
-        messages = [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
+        # memory_context() is re-read per turn so freshly saved facts apply
+        # to the very next message.
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT + memory_context()),
+            *state["messages"],
+        ]
         response = llm.invoke(messages)
         return {"messages": [response]}
 
     graph = StateGraph(MessagesState)
     graph.add_node("assistant", assistant)
-    graph.add_node("tools", ToolNode(TOOLS))
+    graph.add_node("tools", ToolNode(local_tools))
     graph.add_edge(START, "assistant")
     graph.add_conditional_edges("assistant", tools_condition)
     graph.add_edge("tools", "assistant")
 
     return graph.compile(checkpointer=checkpointer or MemorySaver()), resolved_provider
+
+
+def build_voice_agent(model: str, provider: str | None, checkpointer=None):
+    """Build an agent scoped to VOICE_TOOLS (no hosted tools, no start_voice).
+
+    Uses the same checkpointer/thread as the text agent so conversation
+    history is shared across text and voice turns.
+    """
+    agent, resolved_provider = build_agent(
+        model,
+        provider,
+        effort=None,
+        hosted=False,
+        show_thinking=False,
+        checkpointer=checkpointer,
+        tools=VOICE_TOOLS,
+    )
+    return agent, resolved_provider
 
 
 def parse_args() -> argparse.Namespace:
@@ -200,13 +251,17 @@ def extract_thinking(content: str | list) -> str:
     return "\n".join(parts)
 
 
-def stream_turn(agent, prompt: str, config: dict, printer: StreamPrinter) -> None:
+def stream_turn(agent, prompt: str, config: dict, printer: StreamPrinter) -> bool:
     """Run one turn, printing output incrementally as it streams.
 
     stream_mode="messages" yields (chunk, metadata) pairs: AIMessageChunks
     token-by-token from any LLM call in the graph, and complete ToolMessages
     when local tools finish.
+
+    Returns True if start_voice fired this turn, signaling main() to enter
+    voice mode once the turn (and any remaining graph steps) finishes.
     """
+    voice_requested = False
     for chunk, _metadata in agent.stream(
         {"messages": [HumanMessage(content=prompt)]},
         config=config,
@@ -216,12 +271,17 @@ def stream_turn(agent, prompt: str, config: dict, printer: StreamPrinter) -> Non
             printer.feed_ai_content(chunk.content)
         elif isinstance(chunk, ToolMessage):
             printer.feed_local_tool(chunk.name, str(chunk.content))
+            if chunk.name == "start_voice" and str(chunk.content) == VOICE_MODE_SENTINEL:
+                voice_requested = True
+    return voice_requested
 
 
 def main() -> None:
     load_dotenv()
     args = parse_args()
-    checkpointer = MemorySaver()  # outlives hot reloads so history survives them
+    # SQLite-backed LangGraph checkpointer: conversation survives restarts
+    # and hot reloads. Inspect with `python -m memory.inspect`.
+    checkpointer = open_checkpointer()
     try:
         agent, resolved_provider = build_agent(
             args.model,
@@ -241,7 +301,7 @@ def main() -> None:
     make_printer, run_turn = StreamPrinter, stream_turn
     while True:
         try:
-            prompt = input(user_prompt_label()).strip()
+            prompt = read_user_input().strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -270,7 +330,7 @@ def main() -> None:
 
         printer = make_printer("Caranthir", show_thinking=args.show_thinking)
         try:
-            run_turn(agent, prompt, config, printer)
+            voice_requested = run_turn(agent, prompt, config, printer)
         except KeyboardInterrupt:
             printer.finish()
             print_error("interrupted — reply may be incomplete")
@@ -280,6 +340,18 @@ def main() -> None:
             print_error(str(exc))
             continue
         printer.finish()
+
+        if voice_requested:
+            from voice import run_voice_mode
+
+            try:
+                asyncio.run(
+                    run_voice_mode(build_voice_agent, args.model, args.provider, config)
+                )
+            except SystemExit as exc:
+                print_error(str(exc))
+            except Exception as exc:
+                print_error(f"voice session failed: {exc}")
 
 
 if __name__ == "__main__":

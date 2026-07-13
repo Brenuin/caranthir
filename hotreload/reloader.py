@@ -23,8 +23,16 @@ import sys
 
 # Reloaded in this order when any file changes: dependencies first, so that
 # when a dependent module re-executes its `from x import y` lines it binds
-# the freshly reloaded objects.
-WATCHED_MODULES = ["prompts", "terminal_ui", "main"]
+# the freshly reloaded objects. The `memory` package itself is listed after
+# its submodules so its __init__ re-exports the fresh objects.
+WATCHED_MODULES = [
+    "prompts",
+    "memory.store",
+    "memory.tools",
+    "memory",
+    "terminal_ui",
+    "main",
+]
 
 _mtimes: dict[str, float] = {}
 

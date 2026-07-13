@@ -3,3 +3,8 @@
 navigator/
 __pycache__/
 *.py[cod]
+memory/memories.json
+memory/*.sqlite
+memory/agents/
+document_rag/library/*
+!document_rag/library/.gitkeep

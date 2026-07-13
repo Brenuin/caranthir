@@ -1,6 +1,7 @@
 """ANSI terminal formatting for Caranthir. No dependencies beyond the stdlib."""
 
 import sys
+import time
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -42,6 +43,51 @@ def print_banner(model: str, provider: str) -> None:
 
 def user_prompt_label() -> str:
     return style("You", BOLD, GREEN) + style(" > ", DIM)
+
+
+def _drain_pending_console_input() -> str:
+    """Return text already waiting in the console buffer right after Enter.
+
+    Typing can't queue input that fast, so anything pending is the tail of a
+    multi-line paste. Read it raw (echoing manually) rather than with input(),
+    so a paste without a trailing newline can't leave us blocked waiting for
+    an Enter that never comes.
+    """
+    try:
+        import msvcrt
+    except ImportError:
+        return ""  # non-Windows console; paste stays line-by-line there
+    chars: list[str] = []
+    while True:
+        while msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):  # arrow/function key prefix: skip pair
+                msvcrt.getwch()
+                continue
+            if ch == "\r":
+                ch = "\n"
+            chars.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+        # Large pastes can arrive in bursts; only stop once the buffer stays
+        # empty across a short settle window.
+        time.sleep(0.03)
+        if not msvcrt.kbhit():
+            break
+    return "".join(chars).strip("\n")
+
+
+def read_user_input() -> str:
+    """Read one submission; a multi-line paste becomes a single prompt.
+
+    With piped stdin (tests, scripts) this is exactly input(): one line per
+    submission.
+    """
+    first = input(user_prompt_label())
+    if not sys.stdin.isatty():
+        return first
+    rest = _drain_pending_console_input()
+    return f"{first}\n{rest}" if rest else first
 
 
 def print_tool_call(name: str, result: str) -> None:

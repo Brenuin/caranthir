@@ -10,6 +10,7 @@ Terminal agent with streaming replies, conversation memory, and tools. OpenAI an
 | `terminal_ui.py` | Banner, colors, incremental stream printer |
 | `prompts.py` | System prompt |
 | `hotreload/` | Dev hot reload: backend edits apply on the next turn, no restart |
+| `memory/` | Long-term memory: JSON facts store + `remember`/`forget` tools, SQLite conversation checkpoints, `python -m memory.inspect` viewer |
 | `tests.py` | Unit + optional live API tests |
 | `.env` | API keys and defaults (not committed) |
 
@@ -51,8 +52,9 @@ Type a prompt and Enter. `/quit`, `/exit`, or `Ctrl+C` to leave.
 
 ## Behavior
 
-- **Graph:** `assistant` ↔ local `ToolNode`; memory via `MemorySaver` (`thread_id=terminal`)
-- **Local tools:** `get_current_time`
+- **Graph:** `assistant` ↔ local `ToolNode`; conversation checkpointed via LangGraph's `SqliteSaver` to `memory/checkpoints.sqlite` (`thread_id=terminal`), so quitting and relaunching resumes the same conversation — delete the file for a fresh start; `python -m memory.inspect` shows what's saved
+- **Local tools:** `get_current_time`, `remember`, `forget`
+- **Long-term memory:** facts the model saves via `remember` persist across sessions in `memory/memories.json` (gitignored, human-editable); saved facts are injected into the system prompt each turn
 - **Hosted tools** (`--hosted-tools`, Anthropic only): web search, code execution
 - **Streaming:** token output, thinking blocks, and tool markers as they arrive
 - **Hot reload:** edits to `prompts.py`, `terminal_ui.py`, or agent logic in `main.py` are picked up on the next message; the REPL loop and CLI flags still need a restart
